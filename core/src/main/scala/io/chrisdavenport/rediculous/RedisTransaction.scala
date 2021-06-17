@@ -35,7 +35,7 @@ import RedisProtocol._
  * }}}
  **/
 final case class RedisTransaction[A](value: RedisTransaction.RedisTxState[RedisTransaction.Queued[A]]){
-  def transact[F[_]: Concurrent]: Redis[F, RedisTransaction.TxResult[A]] = 
+  def transact[F[_]: Async]: Redis[F, RedisTransaction.TxResult[A]] = 
     RedisTransaction.multiExec[F](this)
 }
 
@@ -106,17 +106,17 @@ object RedisTransaction {
   // ----------
   // Operations
   // ----------
-  def watch[F[_]: Concurrent](keys: List[String]): Redis[F, Status] = 
+  def watch[F[_]: Async](keys: List[String]): Redis[F, Status] = 
     RedisCtx[Redis[F,*]].unkeyed(NonEmptyList("WATCH", keys))
 
-  def unwatch[F[_]: Concurrent]: Redis[F, Status] = 
+  def unwatch[F[_]: Async]: Redis[F, Status] = 
     RedisCtx[Redis[F,*]].unkeyed(NonEmptyList.of("UNWATCH"))
 
   def multiExec[F[_]] = new MultiExecPartiallyApplied[F]
   
   class MultiExecPartiallyApplied[F[_]]{
 
-    def apply[A](tx: RedisTransaction[A])(implicit F: Concurrent[F]): Redis[F, TxResult[A]] = {
+    def apply[A](tx: RedisTransaction[A])(implicit F: Async[F]): Redis[F, TxResult[A]] = {
       Redis(Kleisli{(c: RedisConnection[F]) => 
         val ((_, commandsR, key), Queued(f)) = tx.value.value.run((0, List.empty, None)).value
         val commands = commandsR.reverse

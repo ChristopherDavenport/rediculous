@@ -1,14 +1,14 @@
 import io.chrisdavenport.rediculous._
 import cats.implicits._
 import cats.effect._
-import fs2.io.tcp._
+import cats.effect.Resource
 
 // Send a Single Transaction to the Redis Server
 object TransactionExample extends IOApp {
 
   def run(args: List[String]): IO[ExitCode] = {
     val r = for {
-      blocker <- Blocker[IO]
+      blocker <- Resource.unit[IO]
       sg <- SocketGroup[IO](blocker)
       // maxQueued: How many elements before new submissions semantically block. Tradeoff of memory to queue jobs. 
       // Default 1000 is good for small servers. But can easily take 100,000.

@@ -15,7 +15,7 @@ import cats.effect._
  * if you pipeline and have not actually enterred any redis commands.
  **/
 final case class RedisPipeline[A](value: RedisTransaction.RedisTxState[RedisTransaction.Queued[A]]){
-  def pipeline[F[_]: Concurrent]: Redis[F, A] = RedisPipeline.pipeline[F](this)
+  def pipeline[F[_]: Async]: Redis[F, A] = RedisPipeline.pipeline[F](this)
 }
 
 object RedisPipeline {
@@ -56,7 +56,7 @@ object RedisPipeline {
 
 
   class SendPipelinePartiallyApplied[F[_]]{
-    def apply[A](tx: RedisPipeline[A])(implicit F: Concurrent[F]): Redis[F, A] = {
+    def apply[A](tx: RedisPipeline[A])(implicit F: Async[F]): Redis[F, A] = {
       Redis(Kleisli{(c: RedisConnection[F]) => 
         val ((_, commandsR, key), RedisTransaction.Queued(f)) = tx.value.value.run((0, List.empty, None)).value
         val commands = commandsR.reverse.toNel

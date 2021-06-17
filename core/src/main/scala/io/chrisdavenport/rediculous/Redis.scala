@@ -4,6 +4,7 @@ import cats.data._
 import cats.implicits._
 import cats._
 import cats.effect._
+import cats.effect.kernel.MonadCancelThrow
 
 final case class Redis[F[_], A](unRedis: Kleisli[F, RedisConnection[F], F[A]]){
   def run(connection: RedisConnection[F])(implicit ev: Monad[F]): F[A] = {
@@ -54,7 +55,7 @@ object Redis {
       def apply[A](fa: Par[F,A]): Redis[F,A] = unwrap(fa)
     }
 
-    implicit def parApplicative[F[_]: Parallel: BracketThrow]: Applicative[Par[F, *]] = new Applicative[Par[F, *]]{
+    implicit def parApplicative[F[_]: Parallel: MonadCancelThrow]: Applicative[Par[F, *]] = new Applicative[Par[F, *]]{
       def ap[A, B](ff: Par[F,A => B])(fa: Par[F,A]): Par[F,B] = Par(Redis(
         Par.unwrap(ff).unRedis.flatMap{ ff => 
           Par.unwrap(fa).unRedis.map{fa =>  Parallel[F].sequential(

@@ -1,18 +1,18 @@
 import sbtcrossproject.CrossPlugin.autoImport.{crossProject, CrossType}
 
-val catsV = "2.3.1"
-val catsEffectV = "2.3.1"
-val fs2V = "2.5.0"
+val catsV = "2.6.1"
+val catsEffectV = "3.1.1"
+val fs2V = "3.0.4"
 
-val munitCatsEffectV = "0.12.0"
+val munitCatsEffectV = "1.0.5"
 val specs2V = "4.10.1"
 
-val kindProjectorV = "0.11.2"
+val kindProjectorV = "0.13.0"
 val betterMonadicForV = "0.3.1"
 
-val Scala213 = "2.13.4"
+val Scala213 = "2.13.6"
 
-ThisBuild / crossScalaVersions := Seq("2.12.13", Scala213, "3.0.0-M2", "3.0.0-M3")
+ThisBuild / crossScalaVersions := Seq("2.12.14", Scala213, "3.0.0")
 ThisBuild / scalaVersion := crossScalaVersions.value.last
 
 ThisBuild / githubWorkflowArtifactUpload := false
@@ -89,7 +89,7 @@ lazy val examples = project.in(file("examples"))
   .dependsOn(core)
   .settings(
     name := "rediculous-examples",
-    fork in run := true
+    run / fork := true
   )
 
 lazy val site = project.in(file("site"))
@@ -136,19 +136,19 @@ lazy val commonSettings = Seq(
   testFrameworks += new TestFramework("munit.Framework"),
 
   libraryDependencies ++= {
-    if (isDotty.value) Seq.empty
+    if (scalaVersion.value.startsWith("3")) Seq.empty
     else Seq(
       compilerPlugin("org.typelevel" % "kind-projector" % kindProjectorV cross CrossVersion.full),
       compilerPlugin("com.olegpy" %% "better-monadic-for" % betterMonadicForV),
     )
   },
   scalacOptions ++= {
-    if (isDotty.value) Seq("-source:3.0-migration")
+    if (scalaVersion.value.startsWith("3")) Seq("-source:3.0-migration")
     else Seq()
   },
   Compile / doc / sources := {
     val old = (Compile / doc / sources).value
-    if (isDotty.value)
+    if (scalaVersion.value.startsWith("3"))
       Seq()
     else
       old
@@ -158,14 +158,16 @@ lazy val commonSettings = Seq(
     "org.typelevel"               %% "cats-core"                  % catsV,
 
     "org.typelevel"               %% "cats-effect"                % catsEffectV,
+    "org.typelevel"               %% "cats-effect-kernel"         % catsEffectV,
+    "org.typelevel"               %% "cats-effect-std"            % catsEffectV,
 
     "co.fs2"                      %% "fs2-core"                   % fs2V,
     "co.fs2"                      %% "fs2-io"                     % fs2V,
 
-    "org.typelevel"               %% "keypool"                    % "0.3.0-RC1",
+    "org.typelevel"               %% "keypool"                    % "0.4.5",
 
-    "org.typelevel"               %%% "munit-cats-effect-2"        % munitCatsEffectV         % Test,
-    "org.scalameta"               %% "munit-scalacheck"            % "0.7.20" % Test
+    "org.typelevel"               %% "munit-cats-effect-3"        % munitCatsEffectV         % Test,
+    "org.scalameta"               %% "munit-scalacheck"           % "0.7.26" % Test
 
     // "io.chrisdavenport"           %% "log4cats-core"              % log4catsV,
     // "io.chrisdavenport"           %% "log4cats-slf4j"             % log4catsV     % Test,
@@ -188,9 +190,9 @@ inThisBuild(List(
   licenses += ("MIT", url("http://opensource.org/licenses/MIT")),
 
   pomIncludeRepository := { _ => false},
-  scalacOptions in (Compile, doc) ++= Seq(
+  Compile / doc / scalacOptions ++= Seq(
       "-groups",
-      "-sourcepath", (baseDirectory in LocalRootProject).value.getAbsolutePath,
+      "-sourcepath", (LocalRootProject / baseDirectory).value.getAbsolutePath,
       "-doc-source-url", "https://github.com/ChristopherDavenport/rediculous/blob/v" + version.value + "€{FILE_PATH}.scala"
   )
 ))

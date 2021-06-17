@@ -1,22 +1,34 @@
 package io.chrisdavenport.rediculous
 
-import cats.effect.{MonadThrow => _, _}
-import cats.effect.concurrent._
+import cats.effect._
 import cats.effect.implicits._
 import cats._
 import cats.implicits._
 import cats.data._
 import _root_.org.typelevel.keypool._
-import fs2.concurrent.Queue
-import fs2.io.tcp._
+import cats.effect.std.Queue
 import fs2._
 import java.net.InetSocketAddress
 import scala.concurrent.duration._
 import _root_.io.chrisdavenport.rediculous.cluster.HashSlot
 import _root_.io.chrisdavenport.rediculous.cluster.ClusterCommands
-import fs2.io.tls.TLSContext
-import fs2.io.tls.TLSParameters
-import _root_.io.chrisdavenport.rediculous.cluster.ClusterCommands.ClusterSlots
+import _root_.io.chrisdavenport.rediculous.cluster.ClusterSlots
+import cats.effect.std.Queue
+import fs2.io.net.tls.TLSContext
+import fs2.io.net.tls.TLSParameters
+import cats.MonadThrow
+import cats.effect.{ Deferred, MonadCancel, Ref, Temporal }
+import cats.effect.std.Semaphore
+import fs2.io.net.Socket
+import fs2.io._
+import cats.effect.Concurrent
+import fs2.Chunk.ByteBuffer
+import java.nio.{ ByteBuffer => JByteBuffer }
+import fs2.io.net.SocketGroup
+import fs2.io.net.tls.TLSContext
+import com.comcast.ip4s.SocketAddress
+import com.comcast.ip4s.Host
+import com.comcast.ip4s.Port
 
 sealed trait RedisConnection[F[_]]
 object RedisConnection{
@@ -30,9 +42,12 @@ object RedisConnection{
 
   // Guarantees With Socket That Each Call Receives a Response
   // Chunk must be non-empty but to do so incurs a penalty
-  private[rediculous] def explicitPipelineRequest[F[_]: MonadThrow](socket: Socket[F], calls: Chunk[Resp], maxBytes: Int = 8 * 1024 * 1024, timeout: Option[FiniteDuration] = 5.seconds.some): F[List[Resp]] = {
-    def getTillEqualSize(acc: List[List[Resp]], lastArr: Array[Byte]): F[List[Resp]] = 
-    socket.read(maxBytes, timeout).flatMap{
+  private[rediculous] def explicitPipelineRequest[F[_]: Temporal](socket: Socket[F], calls: Chunk[Resp], maxBytes: Int = 8 * 1024 * 1024, timeout: Option[FiniteDuration] = 5.seconds.some): F[List[Resp]] = {
+    def getTillEqualSize(acc: List[List[Resp]], lastArr: Array[Byte]): F[List[Resp]] =
+      (timeout match {
+        case None => socket.read(maxBytes)
+        case Some(t) => Temporal[F].timeout(socket.read(maxBytes), t)
+      }).flatMap{
       case None => 
         ApplicativeError[F, Throwable].raiseError[List[Resp]](RedisError.Generic("Rediculous: Terminated Before reaching Equal size"))
       case Some(bytes) => 
@@ -51,12 +66,12 @@ object RedisConnection{
           case resp => 
             arrayB.++=(Resp.encode(resp))
         }
-      socket.write(Chunk.bytes(arrayB.toArray)) >>
+      socket.write(Chunk.byteBuffer(JByteBuffer.wrap(arrayB.toArray))) >>
       getTillEqualSize(List.empty, Array.emptyByteArray)
     } else Applicative[F].pure(List.empty)
   }
 
-  def runRequestInternal[F[_]: Concurrent](connection: RedisConnection[F])(
+  def runRequestInternal[F[_]: Async](connection: RedisConnection[F])(
     inputs: NonEmptyList[NonEmptyList[String]],
     key: Option[String]
   ): F[F[NonEmptyList[Resp]]] = {
@@ -71,12 +86,12 @@ object RedisConnection{
       }.rethrow.map(_.pure[F])
       case DirectConnection(socket) => withSocket(socket).map(_.pure[F])
       case Queued(queue, _) => chunk.traverse(resp => Deferred[F, Either[Throwable, Resp]].map((_, resp))).flatMap{ c => 
-        queue.enqueue1(c).as {
+        queue.offer(c).as {
           c.traverse(_._1.get).flatMap(_.sequence.traverse(l => Sync[F].delay(l.toNel.getOrElse(throw RedisError.Generic("Rediculous: Impossible Return List was Empty but we guarantee output matches input"))))).rethrow
         }   
       }
       case Cluster(queue) => chunk.traverse(resp => Deferred[F, Either[Throwable, Resp]].map((_, key, None, 0, resp))).flatMap{ c => 
-        queue.enqueue1(c).as {
+        queue.offer(c).as {
           c.traverse(_._1.get).flatMap(_.sequence.traverse(l => Sync[F].delay(l.toNel.getOrElse(throw RedisError.Generic("Rediculous: Impossible Return List was Empty but we guarantee output matches input"))))).rethrow
         }
       }   
@@ -84,10 +99,10 @@ object RedisConnection{
   }
 
   // Can Be used to implement any low level protocols.
-  def runRequest[F[_]: Concurrent, A: RedisResult](connection: RedisConnection[F])(input: NonEmptyList[String], key: Option[String]): F[F[Either[Resp, A]]] = 
+  def runRequest[F[_]: Async, A: RedisResult](connection: RedisConnection[F])(input: NonEmptyList[String], key: Option[String]): F[F[Either[Resp, A]]] = 
     runRequestInternal(connection)(NonEmptyList.of(input), key).map(_.map(nel => RedisResult[A].decode(nel.head)))
 
-  def runRequestTotal[F[_]: Concurrent, A: RedisResult](input: NonEmptyList[String], key: Option[String]): Redis[F, A] = Redis(Kleisli{(connection: RedisConnection[F]) => 
+  def runRequestTotal[F[_]: Async, A: RedisResult](input: NonEmptyList[String], key: Option[String]): Redis[F, A] = Redis(Kleisli{(connection: RedisConnection[F]) => 
     runRequest(connection)(input, key).map{ fE => 
       fE.flatMap{
         case Right(a) => a.pure[F]
@@ -104,50 +119,50 @@ object RedisConnection{
         case Left(other) => ApplicativeError[F, Throwable].raiseError[A](RedisError.Generic(s"Rediculous: Incompatible Return Type: Got $other"))
       }
 
-  def single[F[_]: Concurrent: ContextShift](
-    sg: SocketGroup,
-    host: String,
-    port: Int,
-    tlsContext: Option[TLSContext] = None,
+  def single[F[_]: Concurrent](
+    sg: SocketGroup[F],
+    host: Host,
+    port: Port,
+    tlsContext: Option[TLSContext[F]] = None,
     tlsParameters: TLSParameters = TLSParameters.Default
   ): Resource[F, RedisConnection[F]] = 
     for {
-      socket <- sg.client[F](new InetSocketAddress(host, port))
+      socket <- sg.client(SocketAddress(host, port))
       out <- elevateSocket(socket, tlsContext, tlsParameters)
     } yield RedisConnection.DirectConnection(out)
 
-  def pool[F[_]: Concurrent: Timer: ContextShift](
-    sg: SocketGroup,
-    host: String,
-    port: Int,
-    tlsContext: Option[TLSContext] = None,
+  def pool[F[_]: Concurrent: Temporal](
+    sg: SocketGroup[F],
+    host: Host,
+    port: Port,
+    tlsContext: Option[TLSContext[F]] = None,
     tlsParameters: TLSParameters = TLSParameters.Default
   ): Resource[F, RedisConnection[F]] = 
     KeyPoolBuilder[F, Unit, (Socket[F], F[Unit])](
-      {_ => sg.client[F](new InetSocketAddress(host, port)).flatMap(elevateSocket(_, tlsContext, tlsParameters)).allocated},
+      {_ => sg.client(SocketAddress(host, port)).flatMap(elevateSocket(_, tlsContext, tlsParameters)).allocated},
       { case (_, shutdown) => shutdown}
     ).build.map(PooledConnection[F](_))
 
   // Only allows 1k queued actions, before new actions block to be accepted.
-  def queued[F[_]: Concurrent: Timer: ContextShift](
-    sg: SocketGroup,
-    host: String,
-    port: Int,
+  def queued[F[_]: Concurrent: Temporal](
+    sg: SocketGroup[F],
+    host: Host,
+    port: Port,
     maxQueued: Int = 10000,
     workers: Int = 2,
-    tlsContext: Option[TLSContext] = None,
+    tlsContext: Option[TLSContext[F]] = None,
     tlsParameters: TLSParameters = TLSParameters.Default
   ): Resource[F, RedisConnection[F]] = 
     for {
-      queue <- Resource.liftF(Queue.bounded[F, Chunk[(Deferred[F, Either[Throwable,Resp]], Resp)]](maxQueued))
+      queue <- Resource.eval(Queue.bounded[F, Chunk[(Deferred[F, Either[Throwable,Resp]], Resp)]](maxQueued))
       keypool <- KeyPoolBuilder[F, Unit, (Socket[F], F[Unit])](
-        {_ => sg.client[F](new InetSocketAddress(host, port))
+        {_ => sg.client(SocketAddress(host, port))
           .flatMap(elevateSocket(_, tlsContext, tlsParameters))
           .allocated
         },
         { case (_, shutdown) => shutdown}
       ).build
-      _ <- 
+      /*_ <- 
           queue.dequeue.chunks.map{chunkChunk =>
             val chunk = chunkChunk.flatten
             val s = if (chunk.nonEmpty) {
@@ -174,24 +189,24 @@ object RedisConnection{
           }.parJoin(workers) // Worker Threads
           .compile
           .drain
-          .background
+          .background*/
     } yield Queued(queue, keypool.take(()).map(_.map(_._1)))
 
-  def cluster[F[_]: Concurrent: Parallel: Timer: ContextShift](
-    sg: SocketGroup,
-    host: String,
-    port: Int,
+  def cluster[F[_]: Async: Temporal](
+    sg: SocketGroup[F],
+    host: Host,
+    port: Port,
     maxQueued: Int = 10000,
     workers: Int = 2,
     parallelServerCalls: Int = Int.MaxValue,
-    tlsContext: Option[TLSContext] = None,
+    tlsContext: Option[TLSContext[F]] = None,
     tlsParameters: TLSParameters = TLSParameters.Default,
     useDynamicRefreshSource: Boolean = true, // Set to false to only use initially provided host for topology refresh
     cacheTopologySeconds: FiniteDuration = 1.second, // How long topology will not be rechecked for after a succesful refresh
   ): Resource[F, RedisConnection[F]] = 
     for {
-      keypool <- KeyPoolBuilder[F, (String, Int), (Socket[F], F[Unit])](
-        {(t: (String, Int)) => sg.client[F](new InetSocketAddress(t._1, t._2))
+      keypool <- KeyPoolBuilder[F, (Host, Port), (Socket[F], F[Unit])](
+        {(t: (Host, Port)) => sg.client(SocketAddress(t._1, t._2))
             .flatMap(elevateSocket(_, tlsContext, tlsParameters))
             .allocated
         },
@@ -199,11 +214,11 @@ object RedisConnection{
       ).build
 
       // Cluster Topology Acquisition and Management
-      sockets <- Resource.liftF(keypool.take((host, port)).map(_.value._1).map(DirectConnection(_)).use(ClusterCommands.clusterslots[Redis[F, *]].run(_)))
-      now <- Resource.liftF(Clock[F].instantNow)
-      refreshLock <- Resource.liftF(Semaphore[F](1L))
-      refTopology <- Resource.liftF(Ref[F].of((sockets, now)))
-      refreshTopology = refreshLock.withPermit(
+      sockets <- Resource.eval(keypool.take((host, port)).map(_.value._1).map(DirectConnection(_)).use(ClusterCommands.clusterslots[Redis[F, *]].run(_)))
+      now <- Resource.eval(Clock[F].realTimeInstant)
+      refreshLock <- Resource.eval(Semaphore[F](1L))
+      refTopology <- Resource.eval(Ref[F].of((sockets, now)))
+      refreshTopology = refreshLock.permit.use(_ =>
         (
           refTopology.get
             .flatMap{ case (topo, setAt) => 
@@ -211,22 +226,22 @@ object RedisConnection{
                 Applicative[F].pure((NonEmptyList((host, port), topo.l.flatMap(c => c.replicas).map(r => (r.host, r.port))), setAt))
               else Applicative[F].pure((NonEmptyList.of((host, port)), setAt))
           },
-          Clock[F].instantNow
+          Clock[F].realTimeInstant
         ).tupled
         .flatMap{
           case ((_, setAt), now) if setAt.isAfter(now.minusSeconds(cacheTopologySeconds.toSeconds)) => Applicative[F].unit
           case ((l, _), _) => 
-            val nelActions: NonEmptyList[F[ClusterSlots]] = l.map{ case (host, port) => 
+            val nelActions: NonEmptyList[F[ClusterSlots]] = l.map{ case (host, port) =>
               keypool.take((host, port)).map(_.value._1).map(DirectConnection(_)).use(ClusterCommands.clusterslots[Redis[F, *]].run(_))
             }
             raceNThrowFirst(nelActions)
-              .flatMap(s => Clock[F].instantNow.flatMap(now => refTopology.set((s,now))))
+              .flatMap(s => Clock[F].realTimeInstant.flatMap(now => refTopology.set((s,now))))
         }
       )
 
-      queue <- Resource.liftF(Queue.bounded[F, Chunk[(Deferred[F, Either[Throwable,Resp]], Option[String], Option[(String, Int)], Int, Resp)]](maxQueued))
+      queue <- Resource.eval(Queue.bounded[F, Chunk[(Deferred[F, Either[Throwable,Resp]], Option[String], Option[(String, Int)], Int, Resp)]](maxQueued))
       cluster = Cluster(queue)
-      _ <- 
+      /*_ <- 
           queue.dequeue.chunks.map{chunkChunk =>
             val chunk = chunkChunk.flatten
             val s = if (chunk.nonEmpty) {
@@ -293,10 +308,10 @@ object RedisConnection{
           }.parJoin(workers)
             .compile
             .drain
-            .background
+            .background*/
     } yield cluster
 
-  private def elevateSocket[F[_]: Concurrent: ContextShift](socket: Socket[F], tlsContext: Option[TLSContext], tlsParameters: TLSParameters): Resource[F, Socket[F]] = 
+  private def elevateSocket[F[_]: Concurrent](socket: Socket[F], tlsContext: Option[TLSContext[F]], tlsParameters: TLSParameters): Resource[F, Socket[F]] = 
     tlsContext.fold(Resource.pure[F, Socket[F]](socket))(c => c.client(socket, tlsParameters))
 
   // ASK 1234-2020 127.0.0.1:6381
@@ -314,14 +329,14 @@ object RedisConnection{
   def raceN[F[_]: Concurrent, A](nel: NonEmptyList[F[A]]): F[Either[NonEmptyList[Throwable], A]] = {
     for {
       deferred <- Deferred[F, A]
-      out <- Bracket[F, Throwable].bracket(
+      out <- MonadCancel[F, Throwable].bracket(
         nel.traverse(fa =>
           Concurrent[F].start(fa.flatMap(a => deferred.complete(a).as(a)).attempt)
         )
       ){
-        (fibers: NonEmptyList[Fiber[F, Either[Throwable, A]]]) => 
+        (fibers: NonEmptyList[Fiber[F, Throwable, Either[Throwable, A]]]) => 
           Concurrent[F].race(
-            fibers.traverse(_.join).map(
+            fibers.traverse(_.joinWithNever).map(
                 _.traverse(_.swap).swap
             ),
             deferred.get
@@ -332,7 +347,7 @@ object RedisConnection{
     } yield out.fold(identity, Either.right)
   }
 
-  def raceNThrowFirst[F[_]: Concurrent, A](nel: NonEmptyList[F[A]]): F[A] = 
+def raceNThrowFirst[F[_]: Async, A](nel: NonEmptyList[F[A]]): F[A] = 
     raceN(nel).flatMap{
       case Left(NonEmptyList(a, _)) => Concurrent[F].raiseError(a)
       case Right(a) => Concurrent[F].pure(a)

@@ -4,6 +4,7 @@ import cats.data._
 import cats.effect._
 import fs2.io.tcp._
 import io.chrisdavenport.rediculous.cluster.ClusterCommands
+import cats.effect.Resource
 
 /**
  * Test App For Development Purposes
@@ -12,7 +13,7 @@ object ZTestApp extends IOApp {
 
   def run(args: List[String]): IO[ExitCode] = {
     val r = for {
-      blocker <- Blocker[IO]
+      blocker <- Resource.unit[IO]
       sg <- SocketGroup[IO](blocker)
       connection <- RedisConnection.pool[IO](sg, "localhost", 30001)
     } yield connection

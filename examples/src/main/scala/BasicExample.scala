@@ -5,6 +5,7 @@ import cats.effect._
 import fs2.io.tcp._
 import fs2._
 import scala.concurrent.duration._
+import cats.effect.Resource
 
 // Mimics 150 req/s load with 4 operations per request.
 // Completes 1,000,000 redis operations
@@ -13,7 +14,7 @@ object BasicExample extends IOApp {
 
   def run(args: List[String]): IO[ExitCode] = {
     val r = for {
-      blocker <- Blocker[IO]
+      blocker <- Resource.unit[IO]
       sg <- SocketGroup[IO](blocker)
       // maxQueued: How many elements before new submissions semantically block. Tradeoff of memory to queue jobs. 
       // Default 1000 is good for small servers. But can easily take 100,000.
